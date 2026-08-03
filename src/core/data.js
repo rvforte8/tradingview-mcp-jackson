@@ -254,6 +254,57 @@ const SCANNER_FIELDS = [
 // so trying every hit costs time without improving the odds.
 const MAX_QUOTE_CANDIDATES = 6;
 
+// The saved watchlists change on human timescales, and a quote should not pay
+// for a refetch. Short enough that an edit shows up within a minute.
+const WATCHLIST_TTL_MS = 60_000;
+let watchlistCache = { at: 0, index: null };
+
+/**
+ * Map bare ticker -> the fully qualified names the user actually follows.
+ *
+ * Every symbol saved in a watchlist carries its exchange, so the account is a
+ * complete statement of which listing is meant by a bare ticker — NASDAQ:PLTR
+ * rather than the TSX, BMV or BYMA lines that a search also returns. That is
+ * recorded intent, not a guess, which is why it is consulted before search.
+ */
+async function watchlistIndex() {
+  if (watchlistCache.index && Date.now() - watchlistCache.at < WATCHLIST_TTL_MS) {
+    return watchlistCache.index;
+  }
+  let symbols = [];
+  try {
+    symbols = await evaluateAsync(`
+      fetch('/api/v1/symbols_list/all/', { credentials: 'include' })
+        .then(function(r) { return r.ok ? r.json() : []; })
+        .then(function(lists) {
+          var out = [];
+          (lists || []).forEach(function(w) {
+            (w.symbols || []).forEach(function(s) {
+              // '###SECTION' rows are headers, not instruments.
+              if (typeof s === 'string' && s.indexOf('###') !== 0 && s.indexOf(':') > 0) out.push(s);
+            });
+          });
+          return out;
+        })
+        .catch(function() { return []; })
+    `) || [];
+  } catch {
+    symbols = [];
+  }
+
+  const index = new Map();
+  for (const full of symbols) {
+    const bare = full.split(':').pop();
+    const seen = index.get(bare);
+    if (!seen) index.set(bare, [full]);
+    else if (!seen.includes(full)) seen.push(full);
+  }
+  // An empty result means the fetch failed, not that the account is empty —
+  // don't cache that or every later quote inherits the outage.
+  if (index.size) watchlistCache = { at: Date.now(), index };
+  return index;
+}
+
 /**
  * Quote a symbol that is not on the chart.
  *
@@ -261,18 +312,41 @@ const MAX_QUOTE_CANDIDATES = 6;
  * requested symbol has to come from elsewhere: TradingView's scanner, which
  * every watchlist row already uses. The scanner indexes by EXCHANGE:SYMBOL and
  * returns null for a bare ticker or the wrong exchange — BATS:PLTR is null even
- * though the chart displays exactly that — so an unresolved symbol is retried
- * through the chart's own symbol search. Both the requested and the resolved
- * name are returned; a caller must never be left assuming it got the symbol it
- * asked for.
+ * though the chart displays exactly that.
+ *
+ * Resolution is tried in descending order of certainty:
+ *   1. the name as given
+ *   2. the user's own watchlists — recorded intent, no guessing
+ *   3. symbol search, but only hits whose ticker is the one asked for
+ *
+ * There is deliberately no looser fourth pass. Search ranks unrelated tail
+ * matches, so one would answer a question nobody asked — BOGUS9 reaches Oslo's
+ * BOHUS — and an unknown ticker is better refused than approximated. Both the
+ * requested and the resolved name are returned; a caller must never be left
+ * assuming it got the symbol it asked for.
  */
 async function quoteBySymbol(symbol) {
   const requested = JSON.stringify(symbol);
+
+  const bare = symbol.includes(':') ? symbol.split(':').pop() : symbol;
+  const index = await watchlistIndex();
+  const fromWatchlist = (index.get(bare) || []).filter(n => n !== symbol);
+
+  // The same ticker on two exchanges is a question only the caller can settle.
+  // Picking one would be a coin flip dressed up as an answer.
+  if (fromWatchlist.length > 1) {
+    throw new Error(
+      `"${symbol}" is ambiguous — your watchlists hold it on more than one exchange: `
+      + `${fromWatchlist.join(', ')}. Ask for the one you want by its full name.`
+    );
+  }
+
   const data = await evaluateAsync(`
     (function() {
       var FIELDS = ${JSON.stringify(SCANNER_FIELDS)};
       var requested = ${requested};
       var MAX_CANDIDATES = ${MAX_QUOTE_CANDIDATES};
+      var FROM_WATCHLIST = ${JSON.stringify(fromWatchlist)};
 
       function scan(sym) {
         return fetch('https://scanner.tradingview.com/symbol?symbol=' + encodeURIComponent(sym)
@@ -300,19 +374,13 @@ async function quoteBySymbol(symbol) {
       // has no entry for a bare root - CME:NQ is null too.
       function candidatesFor(hits, bare) {
         var root = rootOf(bare);
-        // Hits whose ticker is exactly the one asked for come first, but the
-        // rest still follow: the ticker typed is not always the one TradingView
-        // indexes, and dropping those would fail on every alias. Ordering means
-        // a genuine match wins before any looser one is reached.
-        var exact = [], rest = [];
-        hits.forEach(function(h) { (h.symbol === root ? exact : rest).push(h); });
-
+        // Only hits whose ticker is the one asked for. A looser match is not a
+        // weaker answer to the same question, it is an answer to a different
+        // one, so it is dropped rather than ranked lower.
         var out = [];
-        exact.concat(rest).forEach(function(h) {
+        hits.filter(function(h) { return h.symbol === root; }).forEach(function(h) {
           [h.source_id, h.exchange].forEach(function(prefix) {
-            if (!prefix) return;
-            out.push(prefix + ':' + bare);
-            if (h.symbol && h.symbol !== bare) out.push(prefix + ':' + h.symbol);
+            if (prefix) out.push(prefix + ':' + bare);
           });
         });
         return out.filter(function(v, i) { return out.indexOf(v) === i; }).slice(0, MAX_CANDIDATES);
@@ -328,17 +396,20 @@ async function quoteBySymbol(symbol) {
         });
       }
 
-      return scan(requested).then(function(direct) {
-        if (direct && direct.close != null) {
-          return { ok: true, resolved: requested, q: direct };
-        }
-        var bare = bareOf(requested);
+      var bare = bareOf(requested);
+
+      // Tier 1 as given, then tier 2 from the watchlists. Search is a network
+      // call, so it is only reached once both have missed.
+      return firstThatScans([requested].concat(FROM_WATCHLIST), []).then(function(hit) {
+        if (hit.ok) return hit;
         return Promise.resolve(window.TradingViewApi.searchSymbols({ text: bare }))
           .then(function(res) { return (res && res.symbols) || []; })
           .catch(function() { return []; })
           .then(function(hits) {
-            var names = candidatesFor(hits, bare).filter(function(n) { return n !== requested; });
-            return firstThatScans(names, [requested]);
+            var names = candidatesFor(hits, bare).filter(function(n) {
+              return hit.tried.indexOf(n) < 0;
+            });
+            return firstThatScans(names, hit.tried);
           });
       });
     })()
