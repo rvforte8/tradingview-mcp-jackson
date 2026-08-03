@@ -242,11 +242,114 @@ export async function getEquity() {
   return { success: true, data_points: equity?.data?.length || 0, source: equity?.source, data: equity?.data || [], equity_summary: equity?.equity_summary, note: equity?.note, error: equity?.error };
 }
 
+// Fields the scanner exposes per symbol. `change` is a percentage and
+// `change_abs` the price move — they are not interchangeable.
+const SCANNER_FIELDS = [
+  'close', 'open', 'high', 'low', 'volume',
+  'change', 'change_abs', 'description', 'type', 'exchange',
+].join(',');
+
+/**
+ * Quote a symbol that is not on the chart.
+ *
+ * The chart's bar series only ever holds the symbol currently displayed, so a
+ * requested symbol has to come from elsewhere: TradingView's scanner, which
+ * every watchlist row already uses. The scanner indexes by EXCHANGE:SYMBOL and
+ * returns null for a bare ticker or the wrong exchange — BATS:PLTR is null even
+ * though the chart displays exactly that — so an unresolved symbol is retried
+ * once through the chart's own symbol search. Both the requested and the
+ * resolved name are returned; a caller must never be left assuming it got the
+ * symbol it asked for.
+ */
+async function quoteBySymbol(symbol) {
+  const requested = JSON.stringify(symbol);
+  const data = await evaluateAsync(`
+    (function() {
+      var FIELDS = ${JSON.stringify(SCANNER_FIELDS)};
+      var requested = ${requested};
+
+      function scan(sym) {
+        return fetch('https://scanner.tradingview.com/symbol?symbol=' + encodeURIComponent(sym)
+                     + '&fields=' + encodeURIComponent(FIELDS) + '&no_404=true',
+                     { credentials: 'include' })
+          .then(function(r) { return r.ok ? r.json() : null; })
+          .catch(function() { return null; });
+      }
+
+      // Search on the bare ticker: the prefix is what failed, so keeping it
+      // would just reproduce the miss.
+      function resolve(sym) {
+        var bare = sym.indexOf(':') >= 0 ? sym.split(':').pop() : sym;
+        try {
+          return Promise.resolve(window.TradingViewApi.searchSymbols({ text: bare }))
+            .then(function(res) {
+              var hit = (res && res.symbols || [])[0];
+              if (!hit || !hit.symbol) return null;
+              return (hit.exchange ? hit.exchange + ':' : '') + hit.symbol;
+            })
+            .catch(function() { return null; });
+        } catch (e) { return Promise.resolve(null); }
+      }
+
+      return scan(requested).then(function(direct) {
+        if (direct && direct.close != null) {
+          return { ok: true, resolved: requested, q: direct };
+        }
+        return resolve(requested).then(function(alt) {
+          if (!alt) return { ok: false, resolved: null };
+          if (alt === requested) return { ok: false, resolved: null };
+          return scan(alt).then(function(second) {
+            if (second && second.close != null) return { ok: true, resolved: alt, q: second };
+            return { ok: false, resolved: alt };
+          });
+        });
+      });
+    })()
+  `);
+
+  if (!data || !data.ok) {
+    const tried = data?.resolved && data.resolved !== symbol
+      ? ` Tried "${symbol}" and "${data.resolved}".`
+      : ` Tried "${symbol}".`;
+    throw new Error(
+      `Could not resolve a quote for "${symbol}".${tried} `
+      + `The scanner indexes by EXCHANGE:SYMBOL — a bare ticker or the wrong exchange returns nothing. `
+      + `Use symbol_search to find the exact name.`
+    );
+  }
+
+  const q = data.q;
+  return {
+    success: true,
+    symbol: data.resolved,
+    requested_symbol: symbol,
+    // Surfaced so a caller can see the exchange was substituted rather than
+    // silently reading one listing's prices under another's name.
+    resolved_from: data.resolved === symbol ? undefined : symbol,
+    source: 'scanner',
+    open: q.open,
+    high: q.high,
+    low: q.low,
+    close: q.close,
+    last: q.close,
+    volume: q.volume,
+    change: q.change_abs,
+    change_percent: q.change,
+    description: q.description,
+    exchange: q.exchange,
+    type: q.type,
+  };
+}
+
 export async function getQuote({ symbol } = {}) {
+  // A requested symbol cannot be served from the chart's bar series; only the
+  // symbol on screen can. Route it to the scanner instead of relabelling.
+  if (symbol) return quoteBySymbol(symbol);
+
   const data = await evaluate(`
     (function() {
       var api = ${CHART_API};
-      var sym = '${symbol || ''}';
+      var sym = '';
       if (!sym) { try { sym = api.symbol(); } catch(e) {} }
       if (!sym) { try { sym = api.symbolExt().symbol; } catch(e) {} }
       var ext = {};
@@ -274,7 +377,7 @@ export async function getQuote({ symbol } = {}) {
     })()
   `);
   if (!data || (!data.last && !data.close)) throw new Error('Could not retrieve quote. The chart may still be loading.');
-  return { success: true, ...data };
+  return { success: true, source: 'chart', ...data };
 }
 
 export async function getDepth() {

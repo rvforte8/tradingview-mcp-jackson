@@ -35,8 +35,8 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('quote_get', 'Get real-time quote data for a symbol (price, OHLC, volume)', {
-    symbol: z.string().optional().describe('Symbol to quote (blank = current chart symbol)'),
+  server.tool('quote_get', 'Get real-time quote data for a symbol (price, OHLC, volume). Blank reads the chart on screen; naming a symbol queries it directly without changing the chart.', {
+    symbol: z.string().optional().describe('Symbol to quote as EXCHANGE:SYMBOL, e.g. "CME_MINI:ES1!" (blank = current chart symbol). A bare ticker or wrong exchange is resolved via symbol search, and the name actually used comes back as `symbol`.'),
   }, async ({ symbol }) => {
     try { return jsonResult(await core.getQuote({ symbol })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
