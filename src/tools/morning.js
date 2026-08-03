@@ -5,7 +5,7 @@ import * as core from "../core/morning.js";
 export function registerMorningTools(server) {
   server.tool(
     "morning_brief",
-    "Scan your watchlist, read all indicator values, and return structured data for a session brief. Reads rules.json for your bias criteria and watchlist. Claude applies the rules to generate your daily bias.",
+    "Scan one watchlist, read all indicator values, and return structured data for a session brief. Reads rules.json for your bias criteria and watchlists. Claude applies the rules to generate your daily bias. Scanning retargets the chart once per symbol (~2s each), so run one named watchlist at a time.",
     {
       rules_path: z
         .string()
@@ -13,10 +13,16 @@ export function registerMorningTools(server) {
         .describe(
           "Optional path to rules.json. Defaults to rules.json in the project root.",
         ),
+      watchlist: z
+        .string()
+        .optional()
+        .describe(
+          "Name of the watchlist group in rules.json to scan (e.g. 'fx_commodities'). Defaults to default_watchlist.",
+        ),
     },
-    async ({ rules_path } = {}) => {
+    async ({ rules_path, watchlist } = {}) => {
       try {
-        return jsonResult(await core.runBrief({ rules_path }));
+        return jsonResult(await core.runBrief({ rules_path, watchlist }));
       } catch (err) {
         return jsonResult({ success: false, error: err.message }, true);
       }

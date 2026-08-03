@@ -65,13 +65,44 @@ function loadRules(rulesPath) {
   );
 }
 
-export async function runBrief({ rules_path } = {}) {
+/**
+ * Resolve which symbols to scan. rules.json may carry either a single
+ * `watchlist` array (the original shape) or a `watchlists` map of named
+ * groups — scanning every group at once would drive the chart through
+ * hundreds of symbols, so groups are run one at a time.
+ */
+export function resolveWatchlist(rules, requested) {
+  const groups = rules.watchlists;
+
+  if (!groups || typeof groups !== "object") {
+    if (requested) {
+      throw new Error(
+        `No watchlist groups defined in rules.json, so "${requested}" cannot be selected. ` +
+          `Add a "watchlists" object, or omit the watchlist argument to use the plain "watchlist" array.`,
+      );
+    }
+    return { symbols: rules.watchlist || [], name: "watchlist" };
+  }
+
+  const available = Object.keys(groups);
+  const name = requested || rules.default_watchlist || available[0];
+
+  if (!Object.prototype.hasOwnProperty.call(groups, name)) {
+    throw new Error(
+      `Watchlist "${name}" not found in rules.json. Available: ${available.join(", ")}.`,
+    );
+  }
+  return { symbols: groups[name] || [], name };
+}
+
+export async function runBrief({ rules_path, watchlist: requested } = {}) {
   const { rules, path: loadedFrom } = loadRules(rules_path);
-  const { watchlist = [], default_timeframe = "240" } = rules;
+  const { default_timeframe = "240" } = rules;
+  const { symbols: watchlist, name: watchlistName } = resolveWatchlist(rules, requested);
 
   if (!watchlist.length) {
     throw new Error(
-      "rules.json watchlist is empty. Add at least one symbol to your watchlist array.",
+      `rules.json watchlist "${watchlistName}" is empty. Add at least one symbol to it.`,
     );
   }
 
@@ -123,6 +154,8 @@ export async function runBrief({ rules_path } = {}) {
     success: true,
     generated_at: new Date().toISOString(),
     rules_loaded_from: loadedFrom,
+    watchlist_name: watchlistName,
+    watchlist_size: watchlist.length,
     rules: {
       bias_criteria: rules.bias_criteria || null,
       risk_rules: rules.risk_rules || null,
