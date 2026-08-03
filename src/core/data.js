@@ -249,6 +249,11 @@ const SCANNER_FIELDS = [
   'change', 'change_abs', 'description', 'type', 'exchange',
 ].join(',');
 
+// Cap on scanner lookups per unresolved symbol. Each is a network round trip
+// and search returns unrelated tail matches — NQ1! pulls up Nordic warrants —
+// so trying every hit costs time without improving the odds.
+const MAX_QUOTE_CANDIDATES = 6;
+
 /**
  * Quote a symbol that is not on the chart.
  *
@@ -257,9 +262,9 @@ const SCANNER_FIELDS = [
  * every watchlist row already uses. The scanner indexes by EXCHANGE:SYMBOL and
  * returns null for a bare ticker or the wrong exchange — BATS:PLTR is null even
  * though the chart displays exactly that — so an unresolved symbol is retried
- * once through the chart's own symbol search. Both the requested and the
- * resolved name are returned; a caller must never be left assuming it got the
- * symbol it asked for.
+ * through the chart's own symbol search. Both the requested and the resolved
+ * name are returned; a caller must never be left assuming it got the symbol it
+ * asked for.
  */
 async function quoteBySymbol(symbol) {
   const requested = JSON.stringify(symbol);
@@ -267,6 +272,7 @@ async function quoteBySymbol(symbol) {
     (function() {
       var FIELDS = ${JSON.stringify(SCANNER_FIELDS)};
       var requested = ${requested};
+      var MAX_CANDIDATES = ${MAX_QUOTE_CANDIDATES};
 
       function scan(sym) {
         return fetch('https://scanner.tradingview.com/symbol?symbol=' + encodeURIComponent(sym)
@@ -278,41 +284,70 @@ async function quoteBySymbol(symbol) {
 
       // Search on the bare ticker: the prefix is what failed, so keeping it
       // would just reproduce the miss.
-      function resolve(sym) {
-        var bare = sym.indexOf(':') >= 0 ? sym.split(':').pop() : sym;
-        try {
-          return Promise.resolve(window.TradingViewApi.searchSymbols({ text: bare }))
-            .then(function(res) {
-              var hit = (res && res.symbols || [])[0];
-              if (!hit || !hit.symbol) return null;
-              return (hit.exchange ? hit.exchange + ':' : '') + hit.symbol;
-            })
-            .catch(function() { return null; });
-        } catch (e) { return Promise.resolve(null); }
+      function bareOf(sym) { return sym.indexOf(':') >= 0 ? sym.split(':').pop() : sym; }
+
+      // "NQ1!" -> "NQ". Search strips the continuous-contract suffix, returning
+      // the root, so the root is what a hit has to be matched against.
+      function rootOf(ticker) { return ticker.replace(/\\d+!$/, ''); }
+
+      // Names to try against the scanner, best first.
+      //
+      // source_id, not exchange, is the prefix the scanner files a symbol
+      // under. They agree for equities and for COMEX/NYMEX/CBOT futures, and
+      // disagree exactly where it bites: E-mini contracts come back as
+      // exchange CME but live under CME_MINI, so CME:NQ1! is null while
+      // CME_MINI:NQ1! resolves. The suffix is re-attached because the scanner
+      // has no entry for a bare root - CME:NQ is null too.
+      function candidatesFor(hits, bare) {
+        var root = rootOf(bare);
+        // Hits whose ticker is exactly the one asked for come first, but the
+        // rest still follow: the ticker typed is not always the one TradingView
+        // indexes, and dropping those would fail on every alias. Ordering means
+        // a genuine match wins before any looser one is reached.
+        var exact = [], rest = [];
+        hits.forEach(function(h) { (h.symbol === root ? exact : rest).push(h); });
+
+        var out = [];
+        exact.concat(rest).forEach(function(h) {
+          [h.source_id, h.exchange].forEach(function(prefix) {
+            if (!prefix) return;
+            out.push(prefix + ':' + bare);
+            if (h.symbol && h.symbol !== bare) out.push(prefix + ':' + h.symbol);
+          });
+        });
+        return out.filter(function(v, i) { return out.indexOf(v) === i; }).slice(0, MAX_CANDIDATES);
+      }
+
+      function firstThatScans(names, tried) {
+        if (!names.length) return Promise.resolve({ ok: false, tried: tried });
+        var head = names[0];
+        tried.push(head);
+        return scan(head).then(function(q) {
+          if (q && q.close != null) return { ok: true, resolved: head, q: q };
+          return firstThatScans(names.slice(1), tried);
+        });
       }
 
       return scan(requested).then(function(direct) {
         if (direct && direct.close != null) {
           return { ok: true, resolved: requested, q: direct };
         }
-        return resolve(requested).then(function(alt) {
-          if (!alt) return { ok: false, resolved: null };
-          if (alt === requested) return { ok: false, resolved: null };
-          return scan(alt).then(function(second) {
-            if (second && second.close != null) return { ok: true, resolved: alt, q: second };
-            return { ok: false, resolved: alt };
+        var bare = bareOf(requested);
+        return Promise.resolve(window.TradingViewApi.searchSymbols({ text: bare }))
+          .then(function(res) { return (res && res.symbols) || []; })
+          .catch(function() { return []; })
+          .then(function(hits) {
+            var names = candidatesFor(hits, bare).filter(function(n) { return n !== requested; });
+            return firstThatScans(names, [requested]);
           });
-        });
       });
     })()
   `);
 
   if (!data || !data.ok) {
-    const tried = data?.resolved && data.resolved !== symbol
-      ? ` Tried "${symbol}" and "${data.resolved}".`
-      : ` Tried "${symbol}".`;
+    const tried = (data?.tried || [symbol]).map(t => `"${t}"`).join(', ');
     throw new Error(
-      `Could not resolve a quote for "${symbol}".${tried} `
+      `Could not resolve a quote for "${symbol}". Tried ${tried}. `
       + `The scanner indexes by EXCHANGE:SYMBOL — a bare ticker or the wrong exchange returns nothing. `
       + `Use symbol_search to find the exact name.`
     );
