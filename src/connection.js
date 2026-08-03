@@ -4,6 +4,11 @@ let client = null;
 let targetInfo = null;
 const CDP_HOST = 'localhost';
 const CDP_PORT = 9222;
+
+// Pin every tool to one chart window. Set TV_CHART_ID to the slug out of a
+// chart URL — tradingview.com/chart/<slug>/. CDP target ids are regenerated on
+// each restart, so the slug is the only handle that survives one.
+const PINNED_CHART_ID = (process.env.TV_CHART_ID || '').trim();
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
 
@@ -133,21 +138,17 @@ async function probeTarget(target) {
   }
 }
 
-async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+/** The slug in tradingview.com/chart/<slug>/, or null for a non-chart URL. */
+function chartSlug(url) {
+  const m = /\/chart\/([^/?#]+)/i.exec(url || '');
+  return m ? m[1] : null;
+}
 
-  const pages = targets.filter(t => t.type === 'page');
-  // Prefer targets with tradingview.com/chart in the URL
-  const charts = pages.filter(t => /tradingview\.com\/chart/i.test(t.url));
-  const candidates = charts.length ? charts : pages.filter(t => /tradingview/i.test(t.url));
-
-  if (candidates.length === 0) return null;
+// Several windows open (a restored session can bring back half a dozen).
+// Taking the first match attaches to an arbitrary one — often a background
+// window with no initialised chart API — so rank them instead.
+async function bestOf(candidates) {
   if (candidates.length === 1) return candidates[0];
-
-  // Several windows open (a restored session can bring back half a dozen).
-  // Taking the first match attaches to an arbitrary one — often a background
-  // window with no initialised chart API — so rank them instead.
   let best = null;
   let bestScore = -1;
   for (const t of candidates) {
@@ -156,6 +157,33 @@ async function findChartTarget() {
     if (bestScore === MAX_TARGET_SCORE) break;
   }
   return best || candidates[0];
+}
+
+async function findChartTarget() {
+  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const targets = await resp.json();
+
+  const pages = targets.filter(t => t.type === 'page');
+  // Prefer targets with tradingview.com/chart in the URL
+  const charts = pages.filter(t => /tradingview\.com\/chart/i.test(t.url));
+
+  if (PINNED_CHART_ID) {
+    const pinned = charts.filter(t => chartSlug(t.url) === PINNED_CHART_ID);
+    // Falling back to another window would silently serve data for whatever
+    // symbol that window happens to hold — the exact failure the pin prevents.
+    if (pinned.length === 0) {
+      throw new Error(
+        `Pinned chart "${PINNED_CHART_ID}" (TV_CHART_ID) is not open. `
+        + `Open it in TradingView, or unset TV_CHART_ID to auto-select a window.`
+      );
+    }
+    // One slug can be open in more than one window; rank those against each other.
+    return bestOf(pinned);
+  }
+
+  const candidates = charts.length ? charts : pages.filter(t => /tradingview/i.test(t.url));
+  if (candidates.length === 0) return null;
+  return bestOf(candidates);
 }
 
 export async function getTargetInfo() {
