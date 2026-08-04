@@ -1,4 +1,18 @@
 import CDP from 'chrome-remote-interface';
+import { config as loadEnv } from 'dotenv';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Read .env from the project root rather than the working directory, so the
+// CLI and anything else that shells in get the same settings as the MCP
+// server no matter where they are run from. Values already in the
+// environment win — an .mcp.json env block or an inline TV_CHART_ID=... still
+// overrides the file. quiet matters: dotenv's banner goes to stdout, which is
+// the MCP server's JSON-RPC channel.
+loadEnv({
+  path: resolve(dirname(fileURLToPath(import.meta.url)), '..', '.env'),
+  quiet: true,
+});
 
 let client = null;
 let targetInfo = null;
