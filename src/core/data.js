@@ -530,13 +530,44 @@ export async function getDepth() {
   return { success: true, bid_levels: data.bids?.length || 0, ask_levels: data.asks?.length || 0, spread: data.spread, bids: data.bids || [], asks: data.asks || [], raw_values: data.raw_values, note: data.note };
 }
 
+/**
+ * Read current values for every study on the chart.
+ *
+ * The data window alone leaves two blind spots:
+ *  - Studies that express state as colour rather than a number — GoNoGo
+ *    Trend's bar colouring, Volume's up/down bars — put nothing in
+ *    `dataWindowView()`. That state is a palette index on a `colorer` or
+ *    `bar_colorer` plot, which has to be read off the study's own series.
+ *  - A study switched off on the chart computes no data at all, so it used to
+ *    drop out of the output and look no different from one that simply has no
+ *    numbers. Those are now listed separately, with the reason.
+ */
 export async function getStudyValues() {
   const data = await evaluate(`
     (function() {
       var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
       var model = chart.model();
       var sources = model.model().dataSources();
-      var results = [];
+      var studies = [];
+      var inactive = [];
+
+      function paletteColors(source, paletteId) {
+        try { return source.properties().state().palettes[paletteId].colors; }
+        catch(e) { return null; }
+      }
+
+      // A study row is [time, plots[0], plots[1], ...], so plots[i] is at i + 1.
+      // The newest bar can still be forming, so fall back a few bars.
+      function lastRow(source) {
+        try {
+          var rows = source.data()._items;
+          for (var i = rows.length - 1; i >= 0 && i > rows.length - 6; i--) {
+            if (rows[i] && rows[i].value) return rows[i].value;
+          }
+        } catch(e) {}
+        return null;
+      }
+
       for (var si = 0; si < sources.length; si++) {
         var s = sources[si];
         if (!s.metaInfo) continue;
@@ -544,6 +575,7 @@ export async function getStudyValues() {
           var meta = s.metaInfo();
           var name = meta.description || meta.shortDescription || '';
           if (!name) continue;
+
           var values = {};
           try {
             var dwv = s.dataWindowView();
@@ -557,13 +589,57 @@ export async function getStudyValues() {
               }
             }
           } catch(e) {}
-          if (Object.keys(values).length > 0) results.push({ name: name, values: values });
+
+          var colors = {};
+          var plots = meta.plots || [];
+          // Assign, don't just declare — var is function-scoped, so a bare
+          // declaration would carry the previous study's row into this one.
+          var row = undefined;
+          for (var pi = 0; pi < plots.length; pi++) {
+            var plot = plots[pi];
+            if (!plot.palette) continue;
+            if (plot.type !== 'colorer' && plot.type !== 'bar_colorer') continue;
+            if (row === undefined) row = lastRow(s);
+            if (!row) break;
+            var idx = row[pi + 1];
+            if (idx === null || idx === undefined) continue;
+            var swatch = paletteColors(s, plot.palette);
+            // No resolvable colour means the plot is a colorer for something
+            // the study is not drawing — an index on its own says nothing.
+            if (!swatch || !swatch[idx]) continue;
+            var title = (meta.styles && meta.styles[plot.id] && meta.styles[plot.id].title) || plot.id;
+            var entry = { index: idx, color: swatch[idx].color };
+            var named = meta.palettes && meta.palettes[plot.palette] && meta.palettes[plot.palette].colors[idx];
+            if (named && named.name && !/^Color \\d+$/.test(named.name)) entry.name = named.name;
+            if (plot.target) entry.applies_to = plot.target;
+            colors[title] = entry;
+          }
+
+          if (Object.keys(values).length > 0 || Object.keys(colors).length > 0) {
+            var out = { name: name, values: values };
+            if (Object.keys(colors).length > 0) out.colors = colors;
+            studies.push(out);
+          } else if (plots.length > 0 && !meta.is_hidden_study) {
+            // is_hidden_study covers the sources the chart adds for itself —
+            // Dividends, Splits, Earnings, continuous-contract roll dates.
+            var reason = 'no values in the data window';
+            try {
+              if (s.isFailed()) reason = 'failed to load';
+              else if (s.isLoading()) reason = 'still loading';
+              else if (!s.isVisible()) reason = 'switched off on the chart, so nothing is computed';
+            } catch(e) {}
+            inactive.push({ name: name, reason: reason });
+          }
         } catch(e) {}
       }
-      return results;
+      return { studies: studies, inactive: inactive };
     })()
   `);
-  return { success: true, study_count: data?.length || 0, studies: data || [] };
+
+  const studies = data?.studies || [];
+  const result = { success: true, study_count: studies.length, studies };
+  if (data?.inactive?.length) result.inactive_studies = data.inactive;
+  return result;
 }
 
 export async function getPineLines({ study_filter, verbose } = {}) {
