@@ -10,8 +10,15 @@ register("brief", {
       short: "r",
       description: "Path to rules.json (default: ./rules.json)",
     },
+    watchlist: {
+      type: "string",
+      short: "w",
+      description:
+        "Name of a watchlist group in rules.json (default: default_watchlist)",
+    },
   },
-  handler: async ({ rules }) => core.runBrief({ rules_path: rules }),
+  handler: async ({ rules, watchlist }) =>
+    core.runBrief({ rules_path: rules, watchlist }),
 });
 
 register("session", {
