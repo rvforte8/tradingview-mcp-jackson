@@ -459,17 +459,17 @@
   "bias_criteria": {
     "bullish": [
       "Ribbon direction is up (bullish colour)",
-      "Price is above the 20 EMA on the 4H",
+      "Price is above the 34 EMA on the 4H",
       "RSI is below 60 (room to run)"
     ],
     "bearish": [
       "Ribbon direction is down (bearish colour)",
-      "Price is below the 20 EMA on the 4H",
+      "Price is below the 34 EMA on the 4H",
       "RSI is above 40 (room to drop)"
     ],
     "neutral": [
       "Ribbon is flat or mixed",
-      "Price is chopping around the 20 EMA",
+      "Price is chopping around the 34 EMA",
       "RSI is between 45 and 55"
     ]
   },
